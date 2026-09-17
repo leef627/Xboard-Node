@@ -751,28 +751,33 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	return true
 }
 
-// ensureRunning starts the kernel if it is not running and there are users +
-// config available. Returns true if the kernel is running afterwards.
-func (s *Service) ensureRunning() bool {
-	if s.kernel.IsRunning() {
-		return true
-	}
-	if len(s.lastUsers) > 0 && s.lastConfig != nil {
-		return s.startKernel(s.lastConfig, s.lastUsers)
-	}
-	return false
-}
-
 // ─── User update entry points ───────────────────────────────────────────────
 
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	// Prepare limits before exposing new credentials to the kernel. In
+	// particular, the first user must be saved before deciding to start.
+	prevUsers, prevHash := s.prepareUserState(users)
+	if s.lastConfig == nil {
+		// WS may deliver users before config. Keep this snapshot for the
+		// config event to start the kernel once both are available.
 		return
 	}
-
-	prevUsers, prevHash := s.prepareUserState(users)
+	if len(users) == 0 {
+		s.kernel.Stop()
+		s.appliedState.Users = nil
+		return
+	}
+	if !s.kernel.IsRunning() {
+		// Initial setup defers panel certificate overrides when there are
+		// no users, so apply them before this delayed first start.
+		s.applyRemoteOverrides(ctx, s.lastConfig)
+		if !s.startKernel(s.lastConfig, users) {
+			s.restoreUserState(prevUsers, prevHash)
+		}
+		return
+	}
 	added, removed, err := s.kernel.UpdateUsers(users)
 	if err != nil {
 		nlog.Core().Warn(fmt.Sprintf("UpdateUsers failed, restarting kernel: %v", err))
@@ -784,77 +789,30 @@ func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, n
 	if newHash != "" {
 		s.lastUserHash = newHash
 	}
+	s.appliedState.Users = append([]model.UserSpec(nil), users...)
 	if s.nodeLog != nil && (added > 0 || removed > 0) {
 		s.nodeLog.Info(fmt.Sprintf("users updated: +%d -%d", added, removed))
 	}
 }
 
-// applyUserDelta applies an incremental user change (add or remove) directly
-// via the kernel's atomic user API. Kernel updates run before updateUserState.
+// applyUserDelta reconciles the complete desired user set in one kernel update.
+// A credential replacement must not remove the last user via RemoveUsers,
+// which can stop the kernel before the replacement credential is installed.
 func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers []model.UserSpec) {
+	if len(deltaUsers) == 0 {
+		return
+	}
+	var users []model.UserSpec
 	switch action {
 	case "add":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
-			return
-		}
-		merged := mergeUsers(s.lastUsers, deltaUsers)
-
-		if !s.ensureRunning() {
-			return
-		}
-
-		for _, delta := range deltaUsers {
-			for _, old := range s.lastUsers {
-				if old.ID == delta.ID && old.UUID != delta.UUID {
-					s.kernel.RemoveUsers([]model.UserSpec{old})
-					break
-				}
-			}
-		}
-
-		prevUsers, prevHash := s.prepareUserState(merged)
-		added, err := s.kernel.AddUsers(deltaUsers)
-		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("AddUsers failed: %v, falling back to UpdateUsers", err))
-			if _, _, err := s.kernel.UpdateUsers(merged); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
-				return
-			}
-		}
-		if s.nodeLog != nil && added > 0 {
-			s.nodeLog.Info(fmt.Sprintf("users added: +%d", added))
-		}
-
+		users = mergeUsers(s.lastUsers, deltaUsers)
 	case "remove":
-		// Defensive check for empty or nil deltaUsers
-		if deltaUsers == nil || len(deltaUsers) == 0 {
-			return
-		}
-		filtered := subtractUsers(s.lastUsers, deltaUsers)
-
-		if !s.kernel.IsRunning() {
-			return
-		}
-
-		prevUsers, prevHash := s.prepareUserState(filtered)
-		removed, err := s.kernel.RemoveUsers(deltaUsers)
-		if err != nil {
-			nlog.Core().Warn(fmt.Sprintf("RemoveUsers failed: %v, falling back to UpdateUsers", err))
-			if _, _, err := s.kernel.UpdateUsers(filtered); err != nil {
-				nlog.Core().Error(fmt.Sprintf("UpdateUsers fallback failed: %v", err))
-				s.restoreUserState(prevUsers, prevHash)
-				return
-			}
-		}
-		if s.nodeLog != nil && removed > 0 {
-			s.nodeLog.Info(fmt.Sprintf("users removed: -%d", removed))
-		}
-
+		users = subtractUsers(s.lastUsers, deltaUsers)
 	default:
 		nlog.Core().Warn(fmt.Sprintf("unknown user delta action: %s", action))
+		return
 	}
+	s.applyUserUpdate(ctx, users, computeUserHash(users))
 }
 
 // mergeUsers overlays deltaUsers onto base (keyed by ID). New users are

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -15,9 +16,9 @@ import (
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
+	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
-	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -32,8 +33,8 @@ import (
 	"github.com/cedar2025/xboard-node/internal/config"
 	"github.com/cedar2025/xboard-node/internal/kernel"
 	"github.com/cedar2025/xboard-node/internal/kernel/geodata"
-	"github.com/cedar2025/xboard-node/internal/nlog"
 	"github.com/cedar2025/xboard-node/internal/model"
+	"github.com/cedar2025/xboard-node/internal/nlog"
 )
 
 const (
@@ -291,73 +292,21 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 		x.mu.Unlock()
 		return 0, fmt.Errorf("not running")
 	}
-
-	// Merge: overwrite existing users' properties, collect truly new ones.
+	// Merge by stable ID; UpdateUsers also handles credential replacements.
 	userMap := make(map[int]model.UserSpec, len(x.users))
 	for _, u := range x.users {
 		userMap[u.ID] = u
 	}
-	var toAdd []model.UserSpec
 	for _, u := range users {
-		if _, exists := userMap[u.ID]; !exists {
-			toAdd = append(toAdd, u)
-		}
-		userMap[u.ID] = u // always overwrite properties
+		userMap[u.ID] = u
 	}
 	merged := make([]model.UserSpec, 0, len(userMap))
 	for _, u := range userMap {
 		merged = append(merged, u)
 	}
-
-	if len(toAdd) == 0 {
-		// No new kernel users, but properties (limits) may have changed.
-		x.users = merged
-		x.mu.Unlock()
-		x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
-		return 0, nil
-	}
-
-	um, err := x.getUserManager()
-	if err != nil {
-		// Protocol doesn't support UserManager → full restart
-		nc, t := x.nodeConfig, x.tls
-		x.mu.Unlock()
-		nlog.Core().Debug("xray: AddUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, merged, t); err != nil {
-			return 0, err
-		}
-		return len(toAdd), nil
-	}
-
-	proto := x.protocol
-	nc := x.nodeConfig
 	x.mu.Unlock()
-
-	ctx := context.Background()
-	added := 0
-	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user, cannot build account", "user", u.ID, "error", err)
-			continue
-		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed", "user", u.ID, "error", err)
-			continue
-		}
-		added++
-	}
-
-	// Update bookkeeping with full merged list (new users + updated properties).
-	x.mu.Lock()
-	x.users = merged
-	x.mu.Unlock()
-	x.updateDispatcherLimits(merged)
-	x.updateBandwidthLimits(merged)
-
-	nlog.Core().Info("xray: users added via UserManager", "added", added, "total", len(merged))
-	return added, nil
+	added, _, err := x.UpdateUsers(merged)
+	return added, err
 }
 
 // RemoveUsers removes users from the running kernel via xray's UserManager API.
@@ -385,44 +334,17 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		x.mu.Unlock()
 		return 0, nil
 	}
-
 	if len(kept) == 0 {
 		x.mu.Unlock()
 		x.Stop()
-		return removed, nil
-	}
-
-	um, err := x.getUserManager()
-	if err != nil {
-		nc, t := x.nodeConfig, x.tls
+		x.mu.Lock()
+		x.users = nil
 		x.mu.Unlock()
-		nlog.Core().Debug("xray: RemoveUsers fallback to restart", "reason", err)
-		if err := x.Start(nc, kept, t); err != nil {
-			return 0, err
-		}
 		return removed, nil
 	}
 	x.mu.Unlock()
-
-	ctx := context.Background()
-	actualRemoved := 0
-	for _, u := range users {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped", "user", u.ID, "error", err)
-			continue
-		}
-		actualRemoved++
-	}
-
-	x.mu.Lock()
-	x.users = kept
-	x.mu.Unlock()
-	x.updateDispatcherLimits(kept)
-	x.updateBandwidthLimits(kept)
-
-	nlog.Core().Info("xray: users removed via UserManager", "removed", actualRemoved, "total", len(kept))
-	return actualRemoved, nil
+	_, actualRemoved, err := x.UpdateUsers(kept)
+	return actualRemoved, err
 }
 
 // UpdateUsers replaces the entire user set. If only speed/device limits
@@ -463,24 +385,17 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	nc := x.nodeConfig
 	x.mu.Unlock()
 
-	ctx := context.Background()
-
-	// Remove first, then add (order matters for UUID changes on same ID)
-	for _, u := range toRemove {
-		email := userEmail(u.ID)
-		if err := um.RemoveUser(ctx, email); err != nil {
-			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
-		}
-	}
+	// Validate all new credentials before removing any working accounts.
+	accounts := make([]*protocol.MemoryUser, 0, len(toAdd))
 	for _, u := range toAdd {
-		mu, err := toMemoryUser(proto, nc, u)
-		if err != nil {
-			nlog.Core().Warn("xray: skip user in UpdateUsers", "user", u.ID, "error", err)
-			continue
+		account, accountErr := toMemoryUser(proto, nc, u)
+		if accountErr != nil {
+			return 0, 0, fmt.Errorf("build account for user %d: %w", u.ID, accountErr)
 		}
-		if err := um.AddUser(ctx, mu); err != nil {
-			nlog.Core().Warn("xray: AddUser failed in UpdateUsers", "user", u.ID, "error", err)
-		}
+		accounts = append(accounts, account)
+	}
+	if err := updateManagedUsers(context.Background(), um, accounts, toRemove); err != nil {
+		return 0, 0, err
 	}
 
 	x.mu.Lock()
@@ -491,6 +406,48 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 
 	nlog.Core().Info("xray: users updated via UserManager", "added", added, "removed", removed, "total", len(users))
 	return
+}
+
+// updateManagedUsers replaces credentials without stopping the inbound. On
+// failure, undo completed operations and let the caller decide whether to
+// rebuild the kernel; never report a partially applied snapshot as success.
+func updateManagedUsers(ctx context.Context, um xrayProxy.UserManager, toAdd []*protocol.MemoryUser, toRemove []model.UserSpec) error {
+	oldAccounts := make([]*protocol.MemoryUser, 0, len(toRemove))
+	for _, u := range toRemove {
+		email := userEmail(u.ID)
+		account := um.GetUser(ctx, email)
+		if account == nil {
+			return fmt.Errorf("cannot replace missing user %s", email)
+		}
+		oldAccounts = append(oldAccounts, account)
+	}
+	var added, removed []*protocol.MemoryUser
+	rollback := func(cause error) error {
+		for i := len(added) - 1; i >= 0; i-- {
+			if err := um.RemoveUser(ctx, added[i].Email); err != nil {
+				cause = errors.Join(cause, fmt.Errorf("rollback remove %s: %w", added[i].Email, err))
+			}
+		}
+		for _, account := range removed {
+			if err := um.AddUser(ctx, account); err != nil {
+				cause = errors.Join(cause, fmt.Errorf("rollback restore %s: %w", account.Email, err))
+			}
+		}
+		return cause
+	}
+	for _, account := range oldAccounts {
+		if err := um.RemoveUser(ctx, account.Email); err != nil {
+			return rollback(fmt.Errorf("remove user %s: %w", account.Email, err))
+		}
+		removed = append(removed, account)
+	}
+	for _, account := range toAdd {
+		if err := um.AddUser(ctx, account); err != nil {
+			return rollback(fmt.Errorf("add user %s: %w", account.Email, err))
+		}
+		added = append(added, account)
+	}
+	return nil
 }
 
 var _ kernel.Kernel = (*Xray)(nil)

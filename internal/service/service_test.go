@@ -29,24 +29,28 @@ type fakeKernel struct {
 	onUpdateUsers func([]model.UserSpec)
 	onAddUsers    func([]model.UserSpec)
 	onRemoveUsers func([]model.UserSpec)
+	onStart       func(*model.NodeSpec, []model.UserSpec, kernel.TLSCert)
 
 	speedLimitFunc  func(string) *rate.Limiter
 	deviceLimitFunc func(string) (int, bool)
 }
 
-func (f *fakeKernel) Name() string { return "fake" }
-func (f *fakeKernel) Protocols() []string { return []string{"vless"} }
+func (f *fakeKernel) Name() string                      { return "fake" }
+func (f *fakeKernel) Protocols() []string               { return []string{"vless"} }
 func (f *fakeKernel) Capabilities() kernel.Capabilities { return kernel.Capabilities{} }
 func (f *fakeKernel) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
 	f.startCalls++
+	if f.onStart != nil {
+		f.onStart(nodeConfig, users, tls)
+	}
 	if f.startErr != nil {
 		return f.startErr
 	}
 	f.running = true
 	return nil
 }
-func (f *fakeKernel) Stop() { f.running = false }
+func (f *fakeKernel) Stop()           { f.running = false }
 func (f *fakeKernel) IsRunning() bool { return f.running }
 func (f *fakeKernel) Reload(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
 	_, _, _ = nodeConfig, users, tls
@@ -92,13 +96,14 @@ func (f *fakeKernel) CloseUserConnections(ctx context.Context, uuid string) erro
 	return nil
 }
 func (f *fakeKernel) SetSpeedLimitFunc(fn func(uuid string) *rate.Limiter) { f.speedLimitFunc = fn }
-func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool)) { f.deviceLimitFunc = fn }
-func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string) { _ = users }
-func (f *fakeKernel) ClearGlobalDevices() {}
+func (f *fakeKernel) SetDeviceLimitFunc(fn func(uuid string) (int, bool))  { f.deviceLimitFunc = fn }
+func (f *fakeKernel) UpdateGlobalDevices(users map[int][]string)           { _ = users }
+func (f *fakeKernel) ClearGlobalDevices()                                  {}
 
 func newTestService(k *fakeKernel) *Service {
 	sharedLimiter := limiter.New()
 	s := &Service{
+		cfg:          &config.Config{Kernel: config.KernelConfig{Type: "singbox"}},
 		kernel:       k,
 		limiter:      sharedLimiter,
 		speedTracker: limiter.NewSpeedTracker(sharedLimiter),
@@ -179,25 +184,24 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	s.updateUserState(oldUsers)
 
 	delta := []model.UserSpec{{ID: 2, UUID: "uuid-new", SpeedLimit: 8}}
-	k.onAddUsers = func(users []model.UserSpec) {
-		if len(users) != 1 || users[0].UUID != "uuid-new" {
-			t.Fatalf("unexpected users passed to AddUsers: %#v", users)
+	k.onUpdateUsers = func(users []model.UserSpec) {
+		if len(users) != 2 {
+			t.Fatalf("expected old and new users in reconciled snapshot: %#v", users)
 		}
 		if got := k.speedLimitFunc("uuid-new"); got == nil {
-			t.Fatal("expected delta user's limiter to be visible before kernel AddUsers")
+			t.Fatal("expected delta user's limiter to be visible before kernel UpdateUsers")
 		}
 	}
 
 	s.applyUserDelta(context.Background(), "add", delta)
 
-	if got := k.addCalls; got != 1 {
-		t.Fatalf("AddUsers call count = %d, want 1", got)
+	if got := k.updateCalls; got != 1 {
+		t.Fatalf("UpdateUsers call count = %d, want 1", got)
 	}
 	if s.speedTracker.GetLimiter("uuid-new") == nil {
 		t.Fatal("expected limiter for delta-added user after successful update")
 	}
 }
-
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
