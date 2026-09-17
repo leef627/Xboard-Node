@@ -1,10 +1,17 @@
-# XrayR-style: ./config on the host is mounted to /etc/xboard-node in the container.
-# Run all commands from this directory: cd compose && docker compose up -d
-# See README.md in this folder.
+# Run from this checkout: docker compose up -d.
+# Build only when the local image is missing; use --build to update explicitly.
 
 services:
   xboard-node:
-    image: ghcr.io/cedar2025/xboard-node:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      no_cache: true
+      args:
+        SOURCE_REPO: ${SOURCE_REPO:-https://github.com/leef627/xboard-node.git}
+        SOURCE_REF: ${SOURCE_REF:-dev}
+    image: xboard-node:local
+    pull_policy: never
     container_name: xboard-node
     network_mode: host
     restart: unless-stopped
