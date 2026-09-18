@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/cedar2025/xboard-node/internal/nlog"
@@ -19,6 +20,9 @@ const (
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Minute}
+
+// Nodes can share a data directory and discover the same missing file at once.
+var fileLocks sync.Map // absolute path -> *sync.Mutex
 
 func Ensure(dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -61,6 +65,15 @@ func Ensure(dir string, needGeoIP, needGeoSite bool, kernelType string) error {
 
 func ensureFile(dir, name, url string) error {
 	dst := filepath.Join(dir, name)
+	key, err := filepath.Abs(dst)
+	if err != nil {
+		return fmt.Errorf("resolve geo database path: %w", err)
+	}
+	value, _ := fileLocks.LoadOrStore(key, new(sync.Mutex))
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	defer lock.Unlock()
+
 	if _, err := os.Stat(dst); err == nil {
 		return nil
 	}

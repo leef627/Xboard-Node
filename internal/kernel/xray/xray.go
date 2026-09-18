@@ -13,12 +13,14 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/xtls/xray-core/common/platform"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/uuid"
 	xrayCore "github.com/xtls/xray-core/core"
 	featurebandwidth "github.com/xtls/xray-core/features/bandwidth"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/features/stats"
+	"github.com/xtls/xray-core/infra/conf"
 	"github.com/xtls/xray-core/infra/conf/serial"
 	xrayProxy "github.com/xtls/xray-core/proxy"
 	"github.com/xtls/xray-core/proxy/shadowsocks"
@@ -110,32 +112,27 @@ func (x *Xray) Protocols() []string {
 // Crucially, the old instance stays alive until the new one is confirmed
 // running — if StartNew fails, the old instance is untouched.
 //
-//	Phase 1 – Build:      generate protobuf config  (no lock, pure computation)
-//	Phase 2 – Create:     xrayCore.New + capture LD (brief global lock)
+//	Phase 1 – Build:      generate JSON and prepare Geo data (outside creation lock)
+//	Phase 2 – Create:     parse config + xrayCore.New + capture LD (global lock)
 //	Phase 3 – StartNew:   instance.Start            (no lock, potentially slow)
 //	Phase 4 – Swap:       store new, extract old     (brief kernel lock)
 //	Phase 5 – RecycleOld: close old in background    (non-blocking)
 func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls kernel.TLSCert) error {
-	// ── Phase 1: Build config (no shared state) ─────────────────────────
-	x.ensureGeoData(nodeConfig)
-
+	// ── Phase 1: Build config and prepare required Geo databases ────────
 	data, err := marshalConfig(x.cfg, nodeConfig, users, tls)
 	if err != nil {
 		return err
 	}
 
-	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
+	geoDir, err := x.ensureGeoData(data)
 	if err != nil {
-		return fmt.Errorf("parse xray config: %w", err)
+		return err
 	}
 
-	// ── Phase 2: Create instance (global lock for LD capture) ───────────
-	xrayCreationMu.Lock()
-	inst, err := xrayCore.New(pbConfig)
-	ld := globalLimitDispatcher.Load()
-	xrayCreationMu.Unlock()
+	// ── Phase 2: Parse and create with this node's Geo directory ───────
+	inst, ld, err := createXrayInstance(data, geoDir)
 	if err != nil {
-		return fmt.Errorf("create xray: %w", err)
+		return err
 	}
 
 	// ── Phase 3: Start new (no lock, potentially slow) ──────────────────
@@ -584,17 +581,99 @@ func hexEncode(dst, src []byte) {
 	}
 }
 
-// ensureGeoData downloads geo databases when routes reference geoip/geosite.
-func (x *Xray) ensureGeoData(nc *model.NodeSpec) {
-	needIP, needSite := kernel.NeedsGeoIP(nc.Routes), kernel.NeedsGeoSite(nc.Routes)
-	if !needIP && !needSite {
-		return
+// Inspect the final JSON so panel, local and custom-file routes share the same
+// discovery path. StringList accepts both arrays and comma-separated strings,
+// matching Xray's native routing parser.
+func routingGeoDataNeeds(data []byte) (needIP, needSite bool, err error) {
+	var cfg struct {
+		Routing struct {
+			Rules []struct {
+				IP       conf.StringList  `json:"ip"`
+				Source   conf.StringList  `json:"source"`
+				SourceIP *conf.StringList `json:"sourceIP"`
+				LocalIP  conf.StringList  `json:"localIP"`
+				Domain   conf.StringList  `json:"domain"`
+				Domains  conf.StringList  `json:"domains"`
+			} `json:"rules"`
+		} `json:"routing"`
 	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return false, false, fmt.Errorf("inspect xray routing geo data: %w", err)
+	}
+	for _, rule := range cfg.Routing.Rules {
+		source := rule.Source
+		if rule.SourceIP != nil {
+			source = *rule.SourceIP
+		}
+		for _, values := range []conf.StringList{rule.IP, source, rule.LocalIP} {
+			needIP = needIP || hasGeoReference(values, "geoip:", "ext:geoip.dat:", "ext-ip:geoip.dat:")
+		}
+		for _, values := range []conf.StringList{rule.Domain, rule.Domains} {
+			needSite = needSite || hasGeoReference(values, "geosite:", "ext:geosite.dat:", "ext-domain:geosite.dat:")
+		}
+	}
+	return needIP, needSite, nil
+}
+
+func hasGeoReference(values []string, prefixes ...string) bool {
+	for _, value := range values {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(value, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (x *Xray) ensureGeoData(data []byte) (string, error) {
 	dir := x.cfg.GeoDataDir
-	if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
-		nlog.Core().Warn("geo database unavailable", "error", err)
+	if dir == "" {
+		dir = x.cfg.ConfigDir
 	}
-	os.Setenv("XRAY_LOCATION_ASSET", dir)
+	if dir == "" {
+		dir = "."
+	}
+	needIP, needSite, err := routingGeoDataNeeds(data)
+	if err != nil {
+		return "", err
+	}
+	if needIP || needSite {
+		if err := geodata.Ensure(dir, needIP, needSite, "xray"); err != nil {
+			return "", fmt.Errorf("prepare xray geo data in %q: %w", dir, err)
+		}
+	}
+	return dir, nil
+}
+
+func createXrayInstance(data []byte, geoDir string) (*xrayCore.Instance, *LimitDispatcher, error) {
+	xrayCreationMu.Lock()
+	defer xrayCreationMu.Unlock()
+
+	// Xray resolves resources through process-wide environment state. Scope the
+	// canonical variable to parsing/creation so concurrent nodes cannot select
+	// each other's directories, and preserve the caller's environment.
+	previous, existed := os.LookupEnv(platform.AssetLocation)
+	if err := os.Setenv(platform.AssetLocation, geoDir); err != nil {
+		return nil, nil, fmt.Errorf("set xray geo data directory: %w", err)
+	}
+	defer func() {
+		if existed {
+			_ = os.Setenv(platform.AssetLocation, previous)
+		} else {
+			_ = os.Unsetenv(platform.AssetLocation)
+		}
+	}()
+
+	pbConfig, err := serial.LoadJSONConfig(bytes.NewReader(data))
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse xray config: %w", err)
+	}
+	instance, err := xrayCore.New(pbConfig)
+	if err != nil {
+		return nil, nil, fmt.Errorf("create xray: %w", err)
+	}
+	return instance, globalLimitDispatcher.Load(), nil
 }
 
 // marshalConfig builds the xray JSON config and returns the raw bytes.
@@ -760,7 +839,8 @@ func (x *Xray) updateDispatcherLimits(users []model.UserSpec) {
 	ld.UpdateLimits(emailToUID, deviceLimits, nil)
 }
 
-// xrayCreationMu serialises xrayCore.New() + globalLimitDispatcher capture
+// xrayCreationMu serialises Geo resource selection, config parsing,
+// xrayCore.New() and globalLimitDispatcher capture
 // so that concurrent Xray instances in multi-node mode each capture their
 // own LimitDispatcher.
 var xrayCreationMu sync.Mutex
