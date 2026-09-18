@@ -24,9 +24,9 @@ const (
 )
 
 // NodeLog provides structured logging with node context.
-// Format: LEVEL [protocol:port] message
+// Format: LEVEL [protocol_nodeID_listenAddress_port] message
 type NodeLog struct {
-	prefix string // e.g., "shadowsocks:10005" or "trojan:10033"
+	prefix string // e.g., "vless_7_0.0.0.0_443"
 }
 
 // Global logger state
@@ -79,9 +79,12 @@ func SetDefault(prefix string) {
 	mu.Unlock()
 }
 
-// ForNode returns a NodeLog for the given protocol and port.
-func ForNode(protocol string, port int) *NodeLog {
-	key := fmt.Sprintf("%s:%d", normalizeProto(protocol), port)
+// ForNode returns a NodeLog identified by protocol, node ID, and listener.
+func ForNode(protocol string, nodeID int, listenIP string, port int) *NodeLog {
+	if listenIP == "" {
+		listenIP = "::"
+	}
+	key := fmt.Sprintf("%s_%d_%s_%d", protocol, nodeID, listenIP, port)
 	mu.RLock()
 	if nl, ok := nodeLoggers[key]; ok {
 		mu.RUnlock()
@@ -166,7 +169,7 @@ func (nl *NodeLog) Error(msg string, args ...any) {
 }
 
 // logWithColor writes one line to the configured writer (see Init).
-// Format: HH:MM:SS.mmm LEVEL [prefix] message [key=value ...]
+// Format: YYYY/MM/DD HH:MM:SS.ffffff LEVEL [prefix] message [key=value ...]
 func logWithColor(level slog.Level, prefix, msg string, args ...any) {
 	logMu.RLock()
 	out := logWriter
@@ -178,7 +181,7 @@ func logWithColor(level slog.Level, prefix, msg string, args ...any) {
 		return
 	}
 
-	now := time.Now().Format("15:04:05.000")
+	now := time.Now().Format("2006/01/02 15:04:05.000000")
 	fullMsg := formatMsg(msg, args)
 
 	var levelStr string

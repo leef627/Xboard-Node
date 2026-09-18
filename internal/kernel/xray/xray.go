@@ -154,7 +154,7 @@ func (x *Xray) Start(nodeConfig *model.NodeSpec, users []model.UserSpec, tls ker
 	x.nodeConfig = nodeConfig
 	x.tls = tls
 	x.protocol = nodeConfig.Protocol
-	x.inboundTag = nodeConfig.Protocol + "-in"
+	x.inboundTag = inboundTag(x.cfg, nodeConfig)
 	x.cumTraffic = make(map[int][2]int64)
 	x.lastKernelHash = kernel.ComputeHash(nodeConfig, users)
 	x.running.Store(true)

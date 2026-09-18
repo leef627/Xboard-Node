@@ -144,7 +144,9 @@ func newService(cfg *config.Config, cp controlplane.ControlPlane) *Service {
 	case "singbox":
 		k = singbox.New(cfg.Kernel)
 	case "xray":
-		k = xray.New(cfg.Kernel)
+		kernelCfg := cfg.Kernel
+		kernelCfg.NodeID = cfg.Panel.NodeID
+		k = xray.New(kernelCfg)
 	default:
 		nlog.Core().Warn("unsupported kernel type, defaulting to sing-box", "type", cfg.Kernel.Type)
 		k = singbox.New(cfg.Kernel)
@@ -547,10 +549,8 @@ func (s *Service) handleWSEvent(ctx context.Context, event controlplane.Event) {
 			nlog.Core().Warn("ws config validation failed, ignoring update", "error", err)
 			return
 		}
-		// Initialize nodeLog on first config
-		if s.nodeLog == nil {
-			s.nodeLog = nlog.ForNode(event.Config.Protocol, event.Config.ServerPort)
-		}
+		// Keep the logger identity in sync with the current node configuration.
+		s.nodeLog = nlog.ForNode(event.Config.Protocol, s.cfg.Panel.NodeID, event.Config.ListenIP, event.Config.ServerPort)
 		s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(event.Users)))
 		s.metricsMu.Lock()
 		s.lastConfig = event.Config
@@ -658,9 +658,7 @@ func (s *Service) applyPullResult(ctx context.Context, result pullResult) {
 		} else {
 			configChanged = true
 			// Initialize or update node logger
-			if s.nodeLog == nil {
-				s.nodeLog = nlog.ForNode(result.config.Protocol, result.config.ServerPort)
-			}
+			s.nodeLog = nlog.ForNode(result.config.Protocol, s.cfg.Panel.NodeID, result.config.ListenIP, result.config.ServerPort)
 			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 			s.metricsMu.Lock()
 			s.lastConfig = result.config
@@ -739,10 +737,8 @@ func (s *Service) startKernel(nc *model.NodeSpec, users []model.UserSpec) bool {
 	s.appliedState.Config = nc
 	s.appliedState.Users = users
 
-	// Initialize node logger on first successful start
-	if s.nodeLog == nil {
-		s.nodeLog = nlog.ForNode(nc.Protocol, nc.ServerPort)
-	}
+	// Refresh the node logger after each successful start.
+	s.nodeLog = nlog.ForNode(nc.Protocol, s.cfg.Panel.NodeID, nc.ListenIP, nc.ServerPort)
 	s.speedTracker.SetLogCallback(func(msg string) {
 		fullMsg := fmt.Sprintf("speedtracker: %s active_limiters=%d", msg, s.speedTracker.LimitedUserCount())
 		s.nodeLog.Info(fullMsg)
@@ -885,9 +881,8 @@ func (s *Service) applyChanges(ctx context.Context, configChanged, usersChanged 
 		} else {
 			s.appliedState.Config = s.lastConfig
 			s.appliedState.Users = s.lastUsers
-			if s.nodeLog != nil {
-				s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
-			}
+			s.nodeLog = nlog.ForNode(s.lastConfig.Protocol, s.cfg.Panel.NodeID, s.lastConfig.ListenIP, s.lastConfig.ServerPort)
+			s.nodeLog.Info(fmt.Sprintf("config updated, %d users", len(s.lastUsers)))
 		}
 	} else if !s.kernel.IsRunning() {
 		s.startKernel(s.lastConfig, s.lastUsers)

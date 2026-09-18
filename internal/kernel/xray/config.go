@@ -68,7 +68,7 @@ func buildConfig(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.Use
 		"outbounds": outbounds,
 	}
 
-	inbound := buildInbound(nc, users, tc)
+	inbound := buildInbound(kcfg, nc, users, tc)
 	if inbound != nil {
 		cfg["inbounds"] = []M{inbound}
 	} else {
@@ -197,16 +197,27 @@ func xrayLogLevel(singboxLevel string) string {
 	}
 }
 
-func buildInbound(nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
-	listenAddr := "::"
+func inboundListenAddress(nc *model.NodeSpec) string {
 	if nc.ListenIP != "" {
-		listenAddr = nc.ListenIP
+		return nc.ListenIP
 	}
+	return "::"
+}
+
+func inboundTag(kcfg config.KernelConfig, nc *model.NodeSpec) string {
+	return fmt.Sprintf("%s_%d_%s_%d", nc.Protocol, kcfg.NodeID, inboundListenAddress(nc), nc.ServerPort)
+}
+
+func buildInbound(kcfg config.KernelConfig, nc *model.NodeSpec, users []model.UserSpec, tc kernel.TLSCert) M {
 	base := M{
-		"tag":      nc.Protocol + "-in",
-		"listen":   listenAddr,
+		"tag":      inboundTag(kcfg, nc),
+		"listen":   inboundListenAddress(nc),
 		"port":     nc.ServerPort,
 		"protocol": nc.Protocol,
+		"sniffing": M{
+			"enabled":      true,
+			"destOverride": []string{"http", "tls"},
+		},
 		"streamSettings": M{
 			"sockopt": M{
 				"reusePort": true,
@@ -664,18 +675,31 @@ func buildRouting(rules []model.RouteRule, customRouteRules []model.CustomRouteR
 	xrayRules = append(xrayRules, M{
 		"type": "field",
 		"ip": []string{
+			"0.0.0.0/8",
 			"10.0.0.0/8",
 			"100.64.0.0/10",
 			"127.0.0.0/8",
 			"169.254.0.0/16",
 			"172.16.0.0/12",
 			"192.0.0.0/24",
+			"192.0.2.0/24",
 			"192.168.0.0/16",
+			"192.88.99.0/24",
 			"198.18.0.0/15",
+			"198.51.100.0/24",
+			"203.0.113.0/24",
+			"224.0.0.0/3",
+			"::/127",
 			"fc00::/7",
 			"fe80::/10",
-			"::1/128",
+			"ff00::/8",
 		},
+		"outboundTag": "block",
+	})
+	// Protocol blocking is separate from the IP rule: either match must block.
+	xrayRules = append(xrayRules, M{
+		"type":        "field",
+		"protocol":    []string{"bittorrent"},
 		"outboundTag": "block",
 	})
 

@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"slices"
 	"testing"
 
 	"github.com/cedar2025/xboard-node/internal/config"
@@ -263,16 +264,28 @@ func TestBuildRouting_Default(t *testing.T) {
 	routing := buildRouting(nil, nil, nil)
 	rules := routing["rules"].([]M)
 
-	if len(rules) != 1 {
-		t.Fatalf("expected 1 default rule, got %d", len(rules))
+	if len(rules) != 2 {
+		t.Fatalf("expected IP and BitTorrent block rules, got %d", len(rules))
 	}
 
 	if rules[0]["outboundTag"] != "block" {
 		t.Errorf("expected block outbound, got %v", rules[0]["outboundTag"])
 	}
 	ips := rules[0]["ip"].([]string)
-	if len(ips) < 5 {
-		t.Errorf("expected multiple private CIDRs, got %d", len(ips))
+	want := []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.168.0.0/16", "192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/3", "::/127", "fc00::/7", "fe80::/10", "ff00::/8",
+	}
+	if !slices.Equal(ips, want) {
+		t.Errorf("unexpected default block ranges: %v", ips)
+	}
+	if rules[1]["outboundTag"] != "block" || !slices.Equal(rules[1]["protocol"].([]string), []string{"bittorrent"}) {
+		t.Errorf("unexpected protocol block rule: %v", rules[1])
+	}
+	if _, exists := rules[1]["ip"]; exists {
+		t.Fatal("BitTorrent must be blocked independently of the destination IP")
 	}
 }
 
@@ -293,13 +306,13 @@ func TestBuildRouting_WithRules(t *testing.T) {
 	routing := buildRouting(testRouteRules(rules), nil, nil)
 	xrayRules := routing["rules"].([]M)
 
-	// 1 default + 2 domain rules + 1 IP rule = 4
-	if len(xrayRules) != 4 {
-		t.Fatalf("expected 4 rules, got %d", len(xrayRules))
+	// 2 defaults + 2 domain rules + 1 IP rule = 5
+	if len(xrayRules) != 5 {
+		t.Fatalf("expected 5 rules, got %d", len(xrayRules))
 	}
 
 	// Rule 1: domains block
-	r1 := xrayRules[1]
+	r1 := xrayRules[2]
 	domains := r1["domain"].([]string)
 	if len(domains) != 2 {
 		t.Fatalf("expected 2 domains, got %d", len(domains))
@@ -312,14 +325,14 @@ func TestBuildRouting_WithRules(t *testing.T) {
 	}
 
 	// Rule 2: IP block
-	r2 := xrayRules[2]
+	r2 := xrayRules[3]
 	ips := r2["ip"].([]string)
 	if len(ips) != 1 || ips[0] != "10.0.0.0/8" {
 		t.Errorf("unexpected IPs: %v", ips)
 	}
 
 	// Rule 3: direct
-	r3 := xrayRules[3]
+	r3 := xrayRules[4]
 	if r3["outboundTag"] != "direct" {
 		t.Errorf("expected direct, got %v", r3["outboundTag"])
 	}
@@ -343,8 +356,8 @@ func TestBuildRouting_WithCustomRouteRules(t *testing.T) {
 
 	routing := buildRouting(nil, customRules, nil)
 	xrayRules := routing["rules"].([]M)
-	if len(xrayRules) != 6 {
-		t.Fatalf("expected 6 rules, got %d", len(xrayRules))
+	if len(xrayRules) != 7 {
+		t.Fatalf("expected 7 rules, got %d", len(xrayRules))
 	}
 	if xrayRules[0]["outboundTag"] != "warp-jp" {
 		t.Fatalf("expected first custom outbound warp-jp, got %v", xrayRules[0]["outboundTag"])
