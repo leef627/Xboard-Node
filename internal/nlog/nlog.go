@@ -300,9 +300,12 @@ func FullRestart(nl *NodeLog, reason string) {
 	nl.Info(fmt.Sprintf("kernel restart: %s", reason))
 }
 
-// ReportPushed logs a report push event.
-func ReportPushed(users, online int) {
-	Core().Info(fmt.Sprintf("report pushed: %d users, %d online", users, online))
+// ReportPushed logs a report push event with the reporting node's context.
+func ReportPushed(nl *NodeLog, users, online int) {
+	if nl == nil {
+		nl = Core()
+	}
+	nl.Info(fmt.Sprintf("report pushed: %d users, %d online", users, online))
 }
 
 // TrackerStats logs tracker statistics.

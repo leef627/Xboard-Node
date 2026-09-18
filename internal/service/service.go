@@ -935,6 +935,13 @@ func (s *Service) pushReportAsync() {
 	metrics := s.buildMetrics(status)
 	metrics["kernel_status"] = s.kernel.IsRunning()
 
+	// Capture the identity now; configuration may change while the report is sent.
+	reportLog := s.nodeLog
+	if reportLog == nil && s.lastConfig != nil {
+		nc := s.lastConfig
+		reportLog = nlog.ForNode(nc.Protocol, s.cfg.Panel.NodeID, nc.ListenIP, nc.ServerPort)
+	}
+
 	go func() {
 		defer s.pushActive.Store(false)
 		if err := s.sink.Report(controlplane.ReportPayload{Traffic: traffic, Alive: aliveIPs, Online: online, CPU: status.CPU, Mem: [2]uint64{status.MemTotal, status.MemUsed}, Swap: [2]uint64{status.SwapTotal, status.SwapUsed}, Disk: [2]uint64{status.DiskTotal, status.DiskUsed}, Metrics: metrics}); err != nil {
@@ -949,7 +956,7 @@ func (s *Service) pushReportAsync() {
 			return
 		}
 		s.pushBackoff.onSuccess()
-		nlog.ReportPushed(len(traffic), len(online))
+		nlog.ReportPushed(reportLog, len(traffic), len(online))
 	}()
 }
 
